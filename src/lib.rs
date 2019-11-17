@@ -26,7 +26,7 @@ macro_rules! t {
 }
 
 mod handle;
-mod overlapped;
+pub mod overlapped;
 
 pub mod iocp;
 pub mod net;

@@ -1,3 +1,4 @@
+//! Overlapped type.
 use std::fmt;
 use std::io;
 use std::mem;
@@ -7,12 +8,34 @@ use winapi::shared::ntdef::{
     HANDLE,
     NULL,
 };
+use winapi::shared::minwindef::{FALSE, TRUE};
+
 use winapi::um::minwinbase::*;
 use winapi::um::synchapi::*;
+pub use winapi::um::winsock2::{
+    SOCKET,
+    WSAGetOverlappedResult,
+    WSA_IO_INCOMPLETE,
+};
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use event_loop::Watcher;
+
+/// General type for HANDLE and SOCKET.
+#[derive(Copy, Clone)]
+pub enum GeneralHandle {
+    /// Handle
+    Handle(HANDLE),
+    /// Socket
+    Socket(SOCKET)
+}
 
 /// A wrapper around `OVERLAPPED` to provide "rustic" accessors and
 /// initializers.
-pub struct Overlapped(OVERLAPPED);
+pub struct Overlapped(OVERLAPPED, Option<GeneralHandle>);
 
 impl fmt::Debug for Overlapped {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -29,7 +52,17 @@ impl Overlapped {
     /// This is suitable for passing to methods which will then later get
     /// notified via an I/O Completion Port.
     pub fn zero() -> Overlapped {
-        Overlapped(unsafe { mem::zeroed() })
+        Overlapped(unsafe { mem::zeroed() }, None)
+    }
+
+    /// Create a new instance with the handle associated with this overlapped operation.
+    pub fn with_handle(h: HANDLE) -> Overlapped {
+        Overlapped(unsafe { mem::zeroed() }, Some(GeneralHandle::Handle(h)) )
+    }
+
+    /// Create a new instance with the socket associated with this overlapped operation.
+    pub fn with_socket(s: SOCKET) -> Overlapped {
+        Overlapped(unsafe { mem::zeroed() }, Some(GeneralHandle::Socket(s)) )
     }
 
     /// Creates a new `Overlapped` with an initialized non-null `hEvent`.  The caller is
@@ -91,5 +124,49 @@ impl Overlapped {
     /// Reads the `hEvent` field of this structure, may return null.
     pub fn event(&self) -> HANDLE {
         self.0.hEvent
+    }
+}
+
+impl Future for Overlapped {
+    type Output = io::Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut transferred = 0;
+        let mut flags = 0;
+
+        if self.1.is_none() {
+            println!("IS NONE");
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Need handle set.",
+            )));
+        }
+
+        let g = self.1.unwrap();
+
+        if let GeneralHandle::Socket(s) = g {
+            let res = ::cvt(unsafe {
+                WSAGetOverlappedResult(s,
+                                    self.raw(),
+                                    &mut transferred,
+                                    FALSE,
+                                    &mut flags)
+            });
+            match res {
+                Err(e) => {
+                    if e.raw_os_error() == Some(WSA_IO_INCOMPLETE) {
+                        
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Err(e))
+                    }
+                }
+                Ok(_) => {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        } else {
+            panic!("Not implemented.");
+        }
     }
 }

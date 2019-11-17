@@ -15,6 +15,7 @@ abstractions.
 
 [dependencies]
 socket2 = "0.3"
+event-loop = { path = "../event-loop" }
 
 [dependencies.winapi]
 version = "0.3.3"

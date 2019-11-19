@@ -16,6 +16,8 @@ abstractions.
 [dependencies]
 socket2 = "0.3"
 event-loop = { path = "../event-loop" }
+kv-log-macro = "1.0.4"
+log = { version = "0.4.8", features = ["kv_unstable"] }
 
 [dependencies.winapi]
 version = "0.3.3"

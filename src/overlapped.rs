@@ -1,3 +1,4 @@
+#![feature(pin)]
 //! Overlapped type.
 use std::fmt;
 use std::io;
@@ -22,20 +23,18 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use event_loop::Watcher;
+use std::os::windows::io::AsRawSocket;
 
-/// General type for HANDLE and SOCKET.
-#[derive(Copy, Clone)]
-pub enum GeneralHandle {
-    /// Handle
-    Handle(HANDLE),
-    /// Socket
-    Socket(SOCKET)
-}
+extern crate event_loop;
+use self::event_loop::Watcher;
+
+// This doesn't work??
+// use event_loop::Watcher;
+
 
 /// A wrapper around `OVERLAPPED` to provide "rustic" accessors and
 /// initializers.
-pub struct Overlapped(OVERLAPPED, Option<GeneralHandle>);
+pub struct Overlapped(OVERLAPPED);
 
 impl fmt::Debug for Overlapped {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -52,17 +51,7 @@ impl Overlapped {
     /// This is suitable for passing to methods which will then later get
     /// notified via an I/O Completion Port.
     pub fn zero() -> Overlapped {
-        Overlapped(unsafe { mem::zeroed() }, None)
-    }
-
-    /// Create a new instance with the handle associated with this overlapped operation.
-    pub fn with_handle(h: HANDLE) -> Overlapped {
-        Overlapped(unsafe { mem::zeroed() }, Some(GeneralHandle::Handle(h)) )
-    }
-
-    /// Create a new instance with the socket associated with this overlapped operation.
-    pub fn with_socket(s: SOCKET) -> Overlapped {
-        Overlapped(unsafe { mem::zeroed() }, Some(GeneralHandle::Socket(s)) )
+        Overlapped(unsafe { mem::zeroed() } )
     }
 
     /// Creates a new `Overlapped` with an initialized non-null `hEvent`.  The caller is
@@ -127,46 +116,149 @@ impl Overlapped {
     }
 }
 
-impl Future for Overlapped {
-    type Output = io::Result<()>;
+/// Awaitable overlapped.
+pub struct OverlappedFuture<'a, T: AsRawSocket> {
+    overlapped: Overlapped,
+    watcher: &'a Watcher<T>,
+}
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut transferred = 0;
-        let mut flags = 0;
+impl<'a, T: AsRawSocket> OverlappedFuture<'a, T> {
+    /// Create pinned with watcher.
+    pub fn pinned_with_watcher(watcher: &'a Watcher<T>) -> Pin<Box<Self>> {
+        Pin::new(Box::new(OverlappedFuture {
+            overlapped: Overlapped::zero(),
+            watcher,
+        }))
+    }
 
-        if self.1.is_none() {
-            println!("IS NONE");
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Need handle set.",
-            )));
-        }
-
-        let g = self.1.unwrap();
-
-        if let GeneralHandle::Socket(s) = g {
-            let res = ::cvt(unsafe {
-                WSAGetOverlappedResult(s,
-                                    self.raw(),
-                                    &mut transferred,
-                                    FALSE,
-                                    &mut flags)
-            });
-            match res {
-                Err(e) => {
-                    if e.raw_os_error() == Some(WSA_IO_INCOMPLETE) {
-                        
-                        Poll::Pending
-                    } else {
-                        Poll::Ready(Err(e))
-                    }
-                }
-                Ok(_) => {
-                    Poll::Ready(Ok(()))
-                }
-            }
-        } else {
-            panic!("Not implemented.");
+    /// Create with watcher.
+    pub fn with_watcher(watcher: &'a Watcher<T>) -> Self {
+        OverlappedFuture {
+            overlapped: Overlapped::zero(),
+            watcher,
         }
     }
+
+    /// Gain access to the raw underlying data
+    pub fn raw(&self) -> *mut OVERLAPPED {
+        &self.overlapped.0 as *const _ as *mut _
+    }
+
+    
+    fn get_overlapped_result(
+        &self
+    ) -> Poll<<Self as Future>::Output>
+    {
+        let mut transferred = 0;
+        let mut flags = 0;
+        let res = ::cvt(unsafe {
+            WSAGetOverlappedResult(self.watcher.get_ref().as_raw_socket() as SOCKET,
+                                self.raw(),
+                                &mut transferred,
+                                FALSE,
+                                &mut flags)
+        });
+
+        kv_log_macro::info!("Overlapped polled", {
+            thread: std::thread::current().name().unwrap(),
+            thread_id: format!("{:?}", std::thread::current().id()),
+            result: format!("{:?}", res),
+            overlapped: format!("{:#x}", self.raw() as usize),
+            socket: format!("{:#}", self.watcher.get_ref().as_raw_socket() as SOCKET)
+        });
+        kv_log_macro::info!("Dumping overlapped bytes", {
+            thread: std::thread::current().name().unwrap(),
+            thread_id: format!("{:?}", std::thread::current().id()),
+            internal: format!("{:?}", unsafe { (*self.raw()).Internal }),
+            internalhigh: format!("{:?}", unsafe { (*self.raw()).InternalHigh }),
+            u: format!("{:?}", unsafe { (*self.raw()).u.Pointer() }),
+            event: format!("{:?}", unsafe { (*self.raw()).hEvent }),
+        });
+
+        match res {
+            Err(e) => {
+                if e.raw_os_error() == Some(WSA_IO_INCOMPLETE) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Err(e))
+                }
+            }
+            Ok(_) => {
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
+
+
+impl<'a, T: AsRawSocket> Future for OverlappedFuture<'a, T> {
+    type Output = io::Result<()>;
+
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let polled = self.as_ref().get_overlapped_result();
+        if let Poll::Ready(_) = polled {
+            return polled
+        }
+
+        // If in the watcher thread at and we are at this point:
+        // 1. the IO completion is triggered
+        // 2. It wakes everyone in the waker list.
+        // And then we register ourselves to the watcher,
+        // we will never be woken!
+        // Solution: lock the waker list and check again.
+        kv_log_macro::info!("Poll locking waker", {
+            thread: std::thread::current().name().unwrap(),
+            thread_id: format!("{:?}", std::thread::current().id()),
+            socket: format!("{:#}", self.watcher.get_ref().as_raw_socket() as usize),
+            waker: format!("{:?}", cx.waker()),
+        });
+        let mut wakers = self.watcher.lock_wakers().unwrap();
+
+        let polled = self.as_ref().get_overlapped_result();
+        if let Poll::Ready(_) = polled {
+            return polled
+        }
+        
+
+        // Register in wakers list.
+       kv_log_macro::info!("Registering waker", {
+            thread: std::thread::current().name().unwrap(),
+            thread_id: format!("{:?}", std::thread::current().id()),
+            socket: format!("{:#}", self.watcher.get_ref().as_raw_socket() as usize),
+            waker: format!("{:?}", cx.waker()),
+        });
+        if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
+            wakers.push(cx.waker().clone());
+        }
+
+        return polled;
+         
+    }
+    // fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    //     let mut transferred = 0;
+    //     let mut flags = 0;
+    //     let res = ::cvt(unsafe {
+    //         WSAGetOverlappedResult(self.watcher.get_ref().as_raw_socket() as SOCKET,
+    //                             self.raw(),
+    //                             &mut transferred,
+    //                             FALSE,
+    //                             &mut flags)
+    //     });
+
+
+    //     match res {
+    //         Err(e) => {
+    //             if e.raw_os_error() == Some(WSA_IO_INCOMPLETE) {
+    //                 self.watcher.register(cx);
+    //                 Poll::Pending
+    //             } else {
+    //                 Poll::Ready(Err(e))
+    //             }
+    //         }
+    //         Ok(_) => {
+    //             Poll::Ready(Ok(()))
+    //         }
+    //     }
+    // }
 }

@@ -15,9 +15,12 @@ use winapi::um::minwinbase::*;
 use winapi::um::synchapi::*;
 pub use winapi::um::winsock2::{
     SOCKET,
-    WSAGetOverlappedResult,
+    // WSAGetOverlappedResult,
     WSA_IO_INCOMPLETE,
 };
+use winapi::um::ioapiset::{GetOverlappedResult};
+// use winapi::um::winnt::HANDLE;
+
 
 use std::future::Future;
 use std::pin::Pin;
@@ -150,13 +153,15 @@ impl<'a, T: AsRawSocket> OverlappedFuture<'a, T> {
     ) -> Poll<<Self as Future>::Output>
     {
         let mut transferred = 0;
-        let mut flags = 0;
+        // let mut flags = 0;
         let res = ::cvt(unsafe {
-            WSAGetOverlappedResult(self.watcher.get_ref().as_raw_socket() as SOCKET,
+            // WSAGetOverlappedResult(self.watcher.get_ref().as_raw_socket() as SOCKET,
+            GetOverlappedResult(self.watcher.get_ref().as_raw_socket() as HANDLE,
                                 self.raw(),
                                 &mut transferred,
                                 FALSE,
-                                &mut flags)
+                                // &mut flags
+                                )
         });
 
         kv_log_macro::info!("Overlapped polled", {
@@ -232,6 +237,12 @@ impl<'a, T: AsRawSocket> Future for OverlappedFuture<'a, T> {
             wakers.push(cx.waker().clone());
         }
 
+        kv_log_macro::info!("Registered waker", {
+            thread: std::thread::current().name().unwrap(),
+            thread_id: format!("{:?}", std::thread::current().id()),
+            socket: format!("{:#}", self.watcher.get_ref().as_raw_socket() as usize),
+            waker: format!("{:?}", cx.waker()),
+        });
         return polled;
          
     }

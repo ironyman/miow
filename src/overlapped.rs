@@ -163,7 +163,14 @@ impl<'a, T: AsRawSocket> OverlappedFuture<'a, T> {
                                 // &mut flags
                                 )
         });
-
+        kv_log_macro::info!("Dumping overlapped bytes", {
+            thread: std::thread::current().name().unwrap(),
+            thread_id: format!("{:?}", std::thread::current().id()),
+            internal: format!("{:?}", unsafe { (*self.raw()).Internal }),
+            internalhigh: format!("{:?}", unsafe { (*self.raw()).InternalHigh }),
+            u: format!("{:?}", unsafe { (*self.raw()).u.Pointer() }),
+            event: format!("{:?}", unsafe { (*self.raw()).hEvent }),
+        });
         kv_log_macro::info!("Overlapped polled", {
             thread: std::thread::current().name().unwrap(),
             thread_id: format!("{:?}", std::thread::current().id()),
